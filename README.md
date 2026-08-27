@@ -199,6 +199,34 @@ as the one used by [RAGFlow](https://github.com/infiniflow/ragflow), which
 links ONNX Runtime statically to avoid shipping a separate shared library.
 
 
+Testing the static build
+------------------------
+
+The `static` build tag only changes how the ORT symbols are resolved; it does
+**not** link `libonnxruntime.a` for you. Because of that, the package itself
+compiles with just `-ldl` under the `static` tag (e.g. `go vet -tags static
+./...` is a cheap compile-time check that the build tag is wired correctly).
+
+Actually *running* the tests under the `static` tag requires ONNX Runtime to be
+statically linked into the test binary, with its symbols exported, for example:
+
+    CGO_LDFLAGS="-Wl,--allow-multiple-definition \
+      -Wl,--whole-archive -lonnxruntime -Wl,--no-whole-archive \
+      -Wl,--export-dynamic -lstdc++" \
+      go test -tags static ./...
+
+(The `--allow-multiple-definition` flag works around duplicate symbols
+present in some upstream `libonnxruntime.a` static-library packages; it is only
+needed when *linking* the static library, not when using the default shared
+object.) When ORT is not statically linked this way, the static-path tests
+detect that `dlopen(NULL)` cannot resolve `OrtGetApiBase` and `t.Skip`,
+rather than failing — so `go test -tags static ./...` is always safe to run,
+it just won't exercise the static loader unless the binary was linked
+accordingly. A CI job that wants to verify the static path should both run
+`go build -tags static ./...` (compile check) and link `libonnxruntime.a` as
+shown above before running the tests.
+
+
 Running Tests and System Compatibility for Testing
 --------------------------------------------------
 
