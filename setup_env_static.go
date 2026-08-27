@@ -1,4 +1,4 @@
-//go:build !windows && !static
+//go:build !windows && static
 
 package onnxruntime_go
 
@@ -25,12 +25,20 @@ OrtApiBase *CallGetAPIBaseFunction(void *fn) {
 */
 import "C"
 
-// This file includes the code for loading the onnxruntime and setting up the
-// environment on non-Windows systems. For now, it has been tested on Linux and
-// arm64 OSX.
+// This file is compiled instead of setup_env.go when the "static" build tag is
+// set. It is used when ONNX Runtime is linked statically into the main
+// executable (for example via -Wl,--whole-archive -lonnxruntime together with
+// -Wl,--export-dynamic) instead of being loaded from a shared object at
+// runtime.
+//
+// In that configuration the ORT symbols (including OrtGetApiBase) already live
+// in the process's own global symbol table, so we resolve them through
+// dlopen(NULL) rather than loading an external shared library. There is
+// intentionally no .so fallback path: a main executable cannot be dlopen'd by
+// its own file path (glibc rejects it with "cannot dynamically load
+// executable"), so dlopen(NULL) is the only supported mechanism.
 
-// This will contain the handle to the onnxruntime shared library if it has
-// been loaded successfully.
+// This will contain the handle returned by dlopen(NULL) if it succeeded.
 var libraryHandle unsafe.Pointer
 
 func platformCleanup() error {
@@ -59,17 +67,15 @@ func setAppendCoreMLFunctionPointer(libraryHandle unsafe.Pointer) error {
 	return nil
 }
 
+// platformInitializeEnvironment resolves the ONNX Runtime entry points from the
+// running process's own global symbol table. It is used when ORT is linked
+// statically (see the "static" build tag). See the file-level comment above for
+// why dlopen(NULL) is used instead of loading an external shared object.
 func platformInitializeEnvironment() error {
-	if onnxSharedLibraryPath == "" {
-		onnxSharedLibraryPath = "onnxruntime.so"
-	}
-	cName := C.CString(onnxSharedLibraryPath)
-	defer C.free(unsafe.Pointer(cName))
-	handle := C.dlopen(cName, C.RTLD_LAZY)
+	handle := C.dlopen(nil, C.RTLD_LAZY)
 	if handle == nil {
 		msg := C.GoString(C.dlerror())
-		return fmt.Errorf("Error loading ONNX shared library \"%s\": %s",
-			onnxSharedLibraryPath, msg)
+		return fmt.Errorf("Error resolving statically-linked ONNX Runtime via dlopen(NULL): %s", msg)
 	}
 	cFunctionName := C.CString("OrtGetApiBase")
 	defer C.free(unsafe.Pointer(cFunctionName))
@@ -77,8 +83,7 @@ func platformInitializeEnvironment() error {
 	if getAPIBaseProc == nil {
 		C.dlclose(handle)
 		msg := C.GoString(C.dlerror())
-		return fmt.Errorf("Error looking up OrtGetApiBase in \"%s\": %s",
-			onnxSharedLibraryPath, msg)
+		return fmt.Errorf("Error looking up OrtGetApiBase in statically-linked ONNX Runtime: %s", msg)
 	}
 	ortAPIBase := C.CallGetAPIBaseFunction(getAPIBaseProc)
 	tmp := C.SetAPIFromBase((*C.OrtApiBase)(unsafe.Pointer(ortAPIBase)))

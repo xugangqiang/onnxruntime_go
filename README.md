@@ -169,6 +169,36 @@ be removed.  However, they now delegate their functionality to
 `AdvancedSession` directly.
 
 
+Statically Linking ONNX Runtime
+-------------------------------
+
+By default, this library loads `onnxruntime.so` / `.dylib` / `.dll` at runtime
+via `SetSharedLibraryPath`. If you instead link ONNX Runtime statically into
+your main executable, build this package (and your code) with the `static` Go
+build tag:
+
+    go build -tags static
+
+When the `static` tag is set, `platformInitializeEnvironment` resolves the ORT
+entry points from the running process's own global symbol table via
+`dlopen(NULL)`, rather than loading an external shared object. As a result,
+`SetSharedLibraryPath` becomes a no-op and its path argument is ignored.
+
+You are responsible for linking `libonnxruntime.a` into the final binary
+yourself. A typical invocation (GNU ld) looks like:
+
+    #cgo LDFLAGS: -Wl,--whole-archive -lonnxruntime -Wl,--no-whole-archive -Wl,--export-dynamic -lstdc++
+
+The `--whole-archive` flag is required so that the ORT symbols (including
+`OrtGetApiBase`) are retained in the executable, and `--export-dynamic` makes
+them visible to `dlopen(NULL)`. On macOS, use `-force_load` and `-export_dynamic`
+instead of the GNU ld flags. The `static` tag has no effect on Windows builds.
+
+This feature was contributed to support in-process ONNX Runtime backends such
+as the one used by [RAGFlow](https://github.com/infiniflow/ragflow), which
+links ONNX Runtime statically to avoid shipping a separate shared library.
+
+
 Running Tests and System Compatibility for Testing
 --------------------------------------------------
 
