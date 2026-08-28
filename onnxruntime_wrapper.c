@@ -29,6 +29,8 @@ typedef struct {
   void *FreeGPUAllocation;
   void *GetD3D12ResourceFromAllocation;
   void *SessionOptionsAppendExecutionProvider_DML2;
+  void *GetDMLDevice;
+  void *GetDMLCommandQueue;
 } DummyOrtDMLAPI;
 
 int SetAPIFromBase(OrtApiBase *api_base) {
@@ -222,6 +224,94 @@ OrtStatus *AppendExecutionProvider(OrtSessionOptions *o,
     keys, values, num_keys);
 }
 
+OrtStatus *SetOptimizedModelFilePath(OrtSessionOptions *o,
+  char *path) {
+  return ort_api->SetOptimizedModelFilePath(o, (const ORTCHAR_T*) path);
+}
+
+OrtStatus *EnableProfiling(OrtSessionOptions *o, char *path) {
+  return ort_api->EnableProfiling(o, (const ORTCHAR_T*) path);
+}
+
+OrtStatus *DisableProfiling(OrtSessionOptions *o) {
+  return ort_api->DisableProfiling(o);
+}
+
+OrtStatus *RegisterExecutionProviderLibrary(OrtEnv *env,
+  const char *registration_name, char *path) {
+  return ort_api->RegisterExecutionProviderLibrary(env, registration_name,
+    (const ORTCHAR_T *) path);
+}
+
+OrtStatus *UnregisterExecutionProviderLibrary(OrtEnv *env,
+  const char *registration_name) {
+  return ort_api->UnregisterExecutionProviderLibrary(env, registration_name);
+}
+
+OrtStatus *RegisterCustomOpsLibraryV2(
+    OrtSessionOptions *o,
+    const char *library_path) {
+    return ort_api->RegisterCustomOpsLibrary_V2(o, library_path);
+}
+
+OrtStatus *GetEpDevices(OrtEnv *env,
+  const OrtEpDevice * const **out_devices, size_t *out_count) {
+  return ort_api->GetEpDevices(env, out_devices, out_count);
+}
+
+const char *EpDeviceEpName(const OrtEpDevice *device) {
+  return ort_api->EpDevice_EpName(device);
+}
+
+const char *EpDeviceEpVendor(const OrtEpDevice *device) {
+  return ort_api->EpDevice_EpVendor(device);
+}
+
+OrtStatus *AppendExecutionProviderV2(OrtSessionOptions *o, OrtEnv *env,
+  const OrtEpDevice * const *ep_devices, size_t num_ep_devices,
+  const char **keys, const char **values, size_t num_keys) {
+  return ort_api->SessionOptionsAppendExecutionProvider_V2(o, env, ep_devices,
+    num_ep_devices, keys, values, num_keys);
+}
+
+OrtStatus *CreateArenaCfg(size_t max_mem, int arena_extend_strategy,
+  int initial_chunk_size_bytes, int max_dead_bytes_per_chunk,
+  OrtArenaCfg **out) {
+  return ort_api->CreateArenaCfg(max_mem, arena_extend_strategy,
+    initial_chunk_size_bytes, max_dead_bytes_per_chunk, out);
+}
+
+OrtStatus *CreateArenaCfgV2(const char *const *arena_config_keys,
+  const size_t *arena_config_values, size_t num_keys, OrtArenaCfg **out) {
+  return ort_api->CreateArenaCfgV2(arena_config_keys, arena_config_values,
+    num_keys, out);
+}
+
+void ReleaseArenaCfg(OrtArenaCfg *ptr) {
+  ort_api->ReleaseArenaCfg(ptr);
+}
+
+OrtStatus *CreateAndRegisterAllocator(OrtEnv *env,
+  const OrtMemoryInfo *mem_info, const OrtArenaCfg *arena_cfg) {
+  return ort_api->CreateAndRegisterAllocator(env, mem_info, arena_cfg);
+}
+
+OrtStatus *CreateAndRegisterAllocatorV2(OrtEnv *env,
+  const char *provider_type, const OrtMemoryInfo *mem_info,
+  const OrtArenaCfg *arena_cfg, const char *const *provider_options_keys,
+  const char *const *provider_options_values, size_t num_keys) {
+  return ort_api->CreateAndRegisterAllocatorV2(env, provider_type, mem_info,
+    arena_cfg, provider_options_keys, provider_options_values, num_keys);
+}
+
+OrtStatus *RegisterAllocator(OrtEnv *env, OrtAllocator *allocator) {
+  return ort_api->RegisterAllocator(env, allocator);
+}
+
+OrtStatus *UnregisterAllocator(OrtEnv *env, const OrtMemoryInfo *mem_info) {
+  return ort_api->UnregisterAllocator(env, mem_info);
+}
+
 OrtStatus *CreateSession(void *model_data, size_t model_data_length,
     OrtEnv *env, OrtSession **out, OrtSessionOptions *options) {
   OrtStatus *status = NULL;
@@ -295,6 +385,32 @@ OrtStatus *RunOptionsUnsetTerminate(OrtRunOptions *o) {
   return ort_api->RunOptionsUnsetTerminate(o);
 }
 
+OrtStatus *AddRunConfigEntry(OrtRunOptions *o, char *key, char *value) {
+  return ort_api->AddRunConfigEntry(o, key, value);
+}
+
+const char *GetRunConfigEntry(OrtRunOptions *o, char *key) {
+  return ort_api->GetRunConfigEntry(o, key);
+}
+
+OrtStatus *CreateLoraAdapter(char *path, OrtLoraAdapter **out) {
+  return ort_api->CreateLoraAdapter((const ORTCHAR_T*) path, NULL, out);
+}
+
+OrtStatus *CreateLoraAdapterFromArray(void *bytes, size_t num_bytes,
+  OrtLoraAdapter **out) {
+  return ort_api->CreateLoraAdapterFromArray(bytes, num_bytes, NULL, out);
+}
+
+void ReleaseLoraAdapter(OrtLoraAdapter *a) {
+  ort_api->ReleaseLoraAdapter(a);
+}
+
+OrtStatus *RunOptionsAddActiveLoraAdapter(OrtRunOptions *o,
+  OrtLoraAdapter *a) {
+  return ort_api->RunOptionsAddActiveLoraAdapter(o, a);
+}
+
 OrtStatus *RunSessionWithBinding(OrtSession *session, OrtIoBinding *b) {
   return ort_api->RunWithBinding(session, NULL, b);
 }
@@ -363,6 +479,17 @@ OrtStatus *CreateOrtTensorWithShape(void *data, size_t data_size,
   OrtStatus *status = NULL;
   status = ort_api->CreateTensorWithDataAsOrtValue(mem_info, data, data_size,
     shape, shape_size, dtype, out);
+  return status;
+}
+
+OrtStatus *CreateTensorAsOrtValue(int64_t *shape, int64_t shape_size,
+  ONNXTensorElementDataType dtype, OrtValue **out) {
+  OrtStatus *status = NULL;
+  OrtAllocator *allocator = NULL;
+  status = ort_api->GetAllocatorWithDefaultOptions(&allocator);
+  if (status) return status;
+  status = ort_api->CreateTensorAsOrtValue(allocator, shape, shape_size, dtype,
+    out);
   return status;
 }
 
@@ -522,4 +649,33 @@ OrtStatus *CreateOrtValue(OrtValue **in, size_t num_values,
   enum ONNXType value_type, OrtValue **out) {
   return ort_api->CreateValue((const OrtValue* const*) in, num_values,
     value_type, out);
+}
+
+OrtStatus *FillStringTensor(OrtValue *v, char **strings, size_t num_strings) {
+  return ort_api->FillStringTensor(v, (const char* const*) strings,
+    num_strings);
+}
+
+OrtStatus *GetStringTensorDataLength(OrtValue *v, size_t *length) {
+  return ort_api->GetStringTensorDataLength(v, length);
+}
+
+OrtStatus *GetStringTensorContent(OrtValue *v, void *data_buffer,
+  size_t data_size, size_t *offsets_buffer, size_t offsets_length) {
+  return ort_api->GetStringTensorContent(v, data_buffer, data_size,
+    offsets_buffer, offsets_length);
+}
+
+OrtStatus *FillStringTensorElement(OrtValue *v, char *s, size_t index) {
+  return ort_api->FillStringTensorElement(v, s, index);
+}
+
+OrtStatus *GetStringTensorElementLength(OrtValue *v, size_t index,
+  size_t *result) {
+  return ort_api->GetStringTensorElementLength(v, index, result);
+}
+
+OrtStatus *GetStringTensorElement(OrtValue *v, size_t buffer_length,
+  size_t index, void *buffer) {
+  return ort_api->GetStringTensorElement(v, buffer_length, index, buffer);
 }

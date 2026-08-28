@@ -2,10 +2,13 @@ package onnxruntime_go
 
 import (
 	"fmt"
+	"io/fs"
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,6 +16,18 @@ import (
 // Always use the same RNG seed for benchmarks, so we can compare the
 // performance on the same random input data.
 const benchmarkRNGSeed = 12345678
+
+// Retrieves the location of the onnxruntime-extension from the environment variable
+// ONNXRUNTIME_EXTENSIONS_SHARED_LIBRARY_PATH. If not set, the test skips.
+func getTestSharedLibraryExtensionPath(t testing.TB) string {
+	env := os.Getenv("ONNXRUNTIME_EXTENSIONS_SHARED_LIBRARY_PATH")
+	if env == "" {
+		t.Skipf("This test requires onnxruntime-extensions. " +
+			"Set the ONNXRUNTIME_EXTENSIONS_SHARED_LIBRARY_PATH environment variable " +
+			"to run this test on your system.")
+	}
+	return env
+}
 
 // If the ONNXRUNTIME_SHARED_LIBRARY_PATH environment variable is set, then
 // we'll try to use its contents as the location of the shared library for
@@ -23,19 +38,20 @@ func getTestSharedLibraryPath(t testing.TB) string {
 	if toReturn != "" {
 		return toReturn
 	}
-	if runtime.GOOS == "windows" {
+	if (runtime.GOOS == "windows") && (runtime.GOARCH == "amd64") {
 		return "test_data/onnxruntime.dll"
 	}
-	if runtime.GOARCH == "arm64" {
-		if runtime.GOOS == "darwin" {
-			return "test_data/onnxruntime_arm64.dylib"
-		}
+	if (runtime.GOOS == "darwin") && (runtime.GOARCH == "arm64") {
+		return "test_data/onnxruntime_arm64.dylib"
+	}
+	if (runtime.GOOS == "linux") && (runtime.GOARCH == "arm64") {
 		return "test_data/onnxruntime_arm64.so"
 	}
-	if runtime.GOARCH == "amd64" && runtime.GOOS == "darwin" {
-		return "test_data/onnxruntime_amd64.dylib"
-	}
-	return "test_data/onnxruntime.so"
+	t.Fatalf("Unable to find an onnxruntime shared library for GOOS %s and "+
+		"GOARCH %s. Set the ONNXRUNTIME_SHARED_LIBRARY_PATH environment "+
+		"variable to run tests on your system.\n", runtime.GOOS,
+		runtime.GOARCH)
+	return fmt.Sprintf("onnxruntime_%s_%s.so", runtime.GOOS, runtime.GOARCH)
 }
 
 // This must be called prior to running each test.
@@ -232,6 +248,124 @@ func TestBoolTensor(t *testing.T) {
 	for _, b := range tensor2.GetData() {
 		if b {
 			t.Errorf("A new empty bool tensor wasn't initialized to false.\n")
+		}
+	}
+}
+
+func TestStringTensor(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	logContents := func(s *StringTensor, label string) {
+		contents, e := s.GetContents()
+		if e != nil {
+			t.Fatalf("Error getting contents for %s tensor: %s\n", label, e)
+		}
+		t.Logf("Contents of tensor %s:\n", label)
+		for i, v := range contents {
+			t.Logf("  index %d = %s\n", i, v)
+		}
+	}
+
+	// Start with simple string tensor manipulation and verifying error cases.
+	input, e := NewStringTensor(NewShape(2))
+	if e != nil {
+		t.Fatalf("Error creating input tensor: %s\n", e)
+	}
+	defer input.Destroy()
+	// I assume these will be blank.
+	logContents(input, "initial values")
+
+	e = input.SetContents([]string{"I", "eat", "popcorn!"})
+	if e == nil {
+		t.Errorf("Didn't get expected error when providing an incorrect " +
+			"number of strings to SetContents.\n")
+	}
+	t.Logf("Got expected error when providing an incorrect number of "+
+		"strings to SetContents: %s\n", e)
+	e = input.SetContents([]string{"what's", "up?"})
+	if e != nil {
+		t.Fatalf("Got error when setting initial tensor contents: %s\n", e)
+	}
+	logContents(input, "after SetContents")
+
+	tmpString, e := input.GetElement(1)
+	if e != nil {
+		t.Fatalf("Error getting tensor element: %s\n", e)
+	}
+	if tmpString != "up?" {
+		t.Errorf("Got incorrect value for tensor element 1. Got \"%s\".\n",
+			tmpString)
+	}
+
+	e = input.SetElement(45, "???")
+	if e == nil {
+		t.Fatalf("Didn't get expected error when setting an element at an " +
+			"invalid index")
+	}
+	t.Logf("Got expected error when setting an element at an invalid "+
+		"index: %s\n", e)
+
+	e = input.SetElement(1, "")
+	if e != nil {
+		t.Fatalf("Error setting element at index 1: %s\n", e)
+	}
+	logContents(input, "after SetElement")
+
+	// Next, we'll test executing a network, including allowing onnxruntime to
+	// auto-allocate a string tensor.
+	inputContents := []string{"Green Beans", "Something Else"}
+	e = input.SetContents(inputContents)
+	if e != nil {
+		t.Fatalf("Error setting final input contents: %s\n", e)
+	}
+	outputUppercase, e := NewStringTensor(NewShape(2))
+	if e != nil {
+		t.Fatalf("Error creating output tensor: %s\n", e)
+	}
+	defer outputUppercase.Destroy()
+	outputs := []Value{outputUppercase, nil}
+
+	filePath := "test_data/example_strings.onnx"
+	session, e := NewDynamicAdvancedSession(filePath, []string{"input"},
+		[]string{"output_upper", "output_lower"}, nil)
+	if e != nil {
+		t.Fatalf("Error creating session for %s: %s\n", filePath, e)
+	}
+	defer session.Destroy()
+
+	e = session.Run([]Value{input}, outputs)
+	if e != nil {
+		t.Fatalf("Error running %s: %s\n", filePath, e)
+	}
+	defer outputs[1].Destroy()
+
+	outputLowercase, ok := outputs[1].(*StringTensor)
+	if !ok {
+		t.Fatalf("Running %s didn't create a StringTensor output", filePath)
+	}
+
+	logContents(input, "input")
+	logContents(outputLowercase, "outputLowercase")
+	logContents(outputUppercase, "outputUppercase")
+
+	uppercaseStrings, e := outputUppercase.GetContents()
+	if e != nil {
+		t.Fatalf("Error getting uppercase contents: %s\n", e)
+	}
+	lowercaseStrings, e := outputLowercase.GetContents()
+	if e != nil {
+		t.Fatalf("Error getting lowercase contents: %s\n", e)
+	}
+
+	for i, original := range inputContents {
+		if strings.ToLower(original) != lowercaseStrings[i] {
+			t.Errorf("Didn't get expected lowercase version of %s, got %s\n",
+				original, lowercaseStrings[i])
+		}
+		if strings.ToUpper(original) != uppercaseStrings[i] {
+			t.Errorf("Didn't get expected uppercase version of %s, got %s\n",
+				original, uppercaseStrings[i])
 		}
 	}
 }
@@ -511,6 +645,132 @@ func TestBadExecutionProvider(t *testing.T) {
 	}
 	t.Logf("Got expected error when attempting to append a bad execution "+
 		"provider: %s\n", e)
+}
+
+func TestRegisterCustomOpsLibrary(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	options, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("Error creating session options: %s\n", e)
+	}
+	defer options.Destroy()
+
+	e = options.RegisterCustomOpsLibrary(getTestSharedLibraryExtensionPath(t))
+	if e != nil {
+		t.Fatalf("Error registering custom ops library: %s\n", e)
+	}
+}
+
+func TestBadRegisterCustomOpsLibrary(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	options, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("Error creating session options: %s\n", e)
+	}
+	defer options.Destroy()
+
+	e = options.RegisterCustomOpsLibrary("TotalNonsense")
+	if e == nil {
+		t.Fatalf("Didn't get expected error attempting to register a bad " +
+			"custom ops library")
+	}
+	t.Logf("Got expected error when attempting to register a bad "+
+		"custom ops library: %s\n", e)
+}
+
+// Testing the operation of test_data/example_needs_extensions.onnx
+func TestCustomOpsLibrary(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	options, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("Error creating session options: %s\n", e)
+	}
+	defer options.Destroy()
+
+	e = options.RegisterCustomOpsLibrary(getTestSharedLibraryExtensionPath(t))
+	if e != nil {
+		t.Fatalf("Error registering custom ops library: %s\n", e)
+	}
+
+	inputTensor, e := NewStringTensor(Shape{3})
+	if e != nil {
+		t.Fatalf("Error creating input tensor: %s\n", e)
+	}
+	defer inputTensor.Destroy()
+
+	outputTensor, e := NewStringTensor(Shape{3})
+	if e != nil {
+		t.Fatalf("Error creating output tensor: %s\n", e)
+	}
+	defer outputTensor.Destroy()
+
+	inputContents := []string{"i", "eAt", "PoTAtOEs!!"}
+	e = inputTensor.SetContents(inputContents)
+	if e != nil {
+		t.Fatalf("Error setting final input contents: %s\n", e)
+	}
+
+	session, e := NewAdvancedSession("test_data/example_needs_extensions.onnx",
+		[]string{"input"}, []string{"output"},
+		[]ArbitraryTensor{inputTensor}, []ArbitraryTensor{outputTensor}, options)
+	if e != nil {
+		t.Fatalf("Failed creating session: %s\n", e)
+	}
+	defer session.Destroy()
+	e = session.Run()
+	if e != nil {
+		t.Fatalf("Error running session: %s\n", e)
+	}
+
+	output, e := outputTensor.GetContents()
+	if e != nil {
+		t.Fatalf("Error retrieving output tensor: %s\n", e)
+	}
+
+	expectedOutput := []string{"I", "EAT", "POTATOES!!"}
+
+	for i := range expectedOutput {
+		if output[i] != expectedOutput[i] {
+			t.Fatalf("Unexpected output tensor contents: %s != %s", output[i], expectedOutput[i])
+		}
+	}
+}
+
+func TestCustomOpsLibraryWithoutRegistering(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	inputTensor, e := NewStringTensor(Shape{3})
+	if e != nil {
+		t.Fatalf("Error creating input tensor: %s\n", e)
+	}
+	defer inputTensor.Destroy()
+
+	outputTensor, e := NewStringTensor(Shape{3})
+	if e != nil {
+		t.Fatalf("Error creating output tensor: %s\n", e)
+	}
+	defer outputTensor.Destroy()
+
+	inputContents := []string{"i", "eAt", "PoTAtOEs!!"}
+	e = inputTensor.SetContents(inputContents)
+	if e != nil {
+		t.Fatalf("Error setting final input contents: %s\n", e)
+	}
+
+	_, e = NewAdvancedSession("test_data/example_needs_extensions.onnx",
+		[]string{"input"}, []string{"output"},
+		[]ArbitraryTensor{inputTensor}, []ArbitraryTensor{outputTensor}, nil)
+	if e == nil {
+		t.Fatalf("Didn't get expected error attempting to create session for model with unregistered operators")
+	}
+	t.Logf("Got expected error attempting to create session for model with unregistered operators: %s\n", e)
 }
 
 // Used for testing the operation of test_data/example_multitype.onnx
@@ -1609,9 +1869,6 @@ func TestIoBinding(t *testing.T) {
 	// TODO: Create a slightly better test for I/O bindings:
 	//  - Maybe make it something with a fixed input that will perform better
 	//    if bound and unchanged.
-	//  - Have multiple outputs, including ones with multibyte chars in their
-	//    names (if this is supported). This would better exercise the
-	//    GetBoundOutputNames function.
 	filePath := "test_data/example ż 大 김.onnx"
 
 	session, e := NewDynamicAdvancedSession(filePath, nil, nil, nil)
@@ -1694,6 +1951,113 @@ func TestIoBinding(t *testing.T) {
 	if outputTensor.GetData()[0] != 1337 {
 		t.Fatalf("Bad output value, expected 1337, got %d\n",
 			outputTensor.GetData()[0])
+	}
+}
+
+func TestGetBoundOutputNamesMultiple(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+	session, e := NewDynamicAdvancedSession(
+		"test_data/example_several_inputs_and_outputs.onnx", nil, nil, nil)
+	if e != nil {
+		t.Fatalf("Error creating session: %s\n", e)
+	}
+	defer session.Destroy()
+	binding, e := session.CreateIoBinding()
+	if e != nil {
+		t.Fatalf("Error creating I/O binding: %s\n", e)
+	}
+	defer binding.Destroy()
+
+	out1, e := NewEmptyTensor[int64](NewShape(10, 10))
+	if e != nil {
+		t.Fatalf("Error creating out1: %s\n", e)
+	}
+	defer out1.Destroy()
+	out2, e := NewEmptyTensor[float64](NewShape(1, 2, 3, 4, 5))
+	if e != nil {
+		t.Fatalf("Error creating out2: %s\n", e)
+	}
+	defer out2.Destroy()
+	outName1 := "output 1"
+	outName2 := "output 2"
+	if e = binding.BindOutput(outName1, out1); e != nil {
+		t.Fatalf("Error binding output 1: %s\n", e)
+	}
+	if e = binding.BindOutput(outName2, out2); e != nil {
+		t.Fatalf("Error binding output 2: %s\n", e)
+	}
+
+	names, e := binding.GetBoundOutputNames()
+	if e != nil {
+		t.Fatalf("Error getting bound output names: %s\n", e)
+	}
+	want := []string{outName1, outName2}
+	if len(names) != len(want) {
+		t.Fatalf("Expected %d names, got %d: %v\n", len(want), len(names), names)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("names[%d] = %q, want %q\n", i, names[i], want[i])
+		}
+	}
+}
+
+func TestGetBoundOutputNamesMultipleWithMultibyteChars(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+	session, e := NewDynamicAdvancedSession(
+		"test_data/example_several_inputs_and_outputs.onnx", nil, nil, nil)
+	if e != nil {
+		t.Fatalf("Error creating session: %s\n", e)
+	}
+	defer session.Destroy()
+	binding, e := session.CreateIoBinding()
+	if e != nil {
+		t.Fatalf("Error creating I/O binding: %s\n", e)
+	}
+	defer binding.Destroy()
+
+	in1, e := NewEmptyTensor[int32](NewShape(1))
+	if e != nil {
+		t.Fatalf("Error creating in1: %s\n", e)
+	}
+	defer in1.Destroy()
+	out1, e := NewEmptyTensor[int64](NewShape(10, 10))
+	if e != nil {
+		t.Fatalf("Error creating out1: %s\n", e)
+	}
+	defer out1.Destroy()
+	out2, e := NewEmptyTensor[float64](NewShape(1, 2, 3, 4, 5))
+	if e != nil {
+		t.Fatalf("Error creating out2: %s\n", e)
+	}
+	defer out2.Destroy()
+
+	// Each name has multiple multibyte characters, and the two output names
+	// have differing byte-lengths to exercise the slicing math used in
+	// GetBoundOutputNames.
+	outName1 := "β出力"
+	outName2 := "γδε結果"
+	if e = binding.BindOutput(outName1, out1); e != nil {
+		t.Fatalf("Error binding %q: %s\n", outName1, e)
+	}
+	if e = binding.BindOutput(outName2, out2); e != nil {
+		t.Fatalf("Error binding %q: %s\n", outName2, e)
+	}
+
+	names, e := binding.GetBoundOutputNames()
+	if e != nil {
+		t.Fatalf("Error getting bound output names: %s\n", e)
+	}
+	want := []string{outName1, outName2}
+	if len(names) != len(want) {
+		t.Fatalf("Expected %d names, got %d: %v\n", len(want), len(names), names)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("names[%d] = %q, want %q\n", i, names[i], want[i])
+		}
 	}
 }
 
@@ -1807,6 +2171,73 @@ func TestSessionOptionsConfig(t *testing.T) {
 	if value != expectedValue {
 		t.Errorf("Got incorrect value for config entry %s: expected %s, "+
 			"got %s\n", key, expectedValue, value)
+	}
+}
+
+func TestSessionWithProfilingAndOptimization(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+	tmpDir := t.TempDir()
+	profilePrefix := filepath.Join(tmpDir, "profile")
+	optimizedModelPath := filepath.Join(tmpDir, "optimized_model.onnx")
+	options, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("Error creating session options: %s\n", e)
+	}
+	defer options.Destroy()
+	e = options.SetOptimizedModelFilePath(optimizedModelPath)
+	if e != nil {
+		t.Fatalf("Error setting optimized model file path to %s: %s",
+			optimizedModelPath, e)
+	}
+	e = options.EnableProfiling(profilePrefix)
+	if e != nil {
+		t.Fatalf("Error setting profile path prefix to %s: %s", profilePrefix,
+			e)
+	}
+
+	// Set up and run a useless session to make sure our files got created.
+	originalModelPath := "test_data/example ż 大 김.onnx"
+	input := newTestTensor[int32](t, NewShape(1, 2))
+	defer input.Destroy()
+	output := newTestTensor[int32](t, NewShape(1))
+	defer output.Destroy()
+	session, e := NewAdvancedSession(originalModelPath, []string{"in"},
+		[]string{"out"}, []Value{input}, []Value{output}, options)
+	if e != nil {
+		t.Fatalf("Failed creating session: %s\n", e)
+	}
+	e = session.Run()
+	// Destroy the session now so its profile is written.
+	session.Destroy()
+	if e != nil {
+		t.Fatalf("Error running session: %s\n", e)
+	}
+
+	numFiles := 0
+	e = filepath.Walk(tmpDir, func(f string, n fs.FileInfo, e error) error {
+		if e != nil {
+			t.Errorf("Got error traversing temp directory %s: %s\n", tmpDir, e)
+			return e
+		}
+		if f == tmpDir {
+			// Don't log or count the directory itself; we just want to ensure
+			// the profile and the model file were created.
+			return nil
+		}
+		t.Logf("Found file %s: %d bytes\n", f, n.Size())
+		numFiles++
+		return nil
+	})
+	if numFiles < 2 {
+		t.Errorf("Failed to create both a profile and an optimized model;  "+
+			"only found %d files in temp dir %s\n", numFiles, tmpDir)
+	}
+
+	e = options.DisableProfiling()
+	if e != nil {
+		t.Errorf("Error disabling profiling on session options where it "+
+			"was previously enabled: %s\n", e)
 	}
 }
 
@@ -2251,7 +2682,8 @@ func TestCancelWithRunOptions_AdvancedSession(t *testing.T) {
 	defer output.Destroy()
 
 	filePath := "test_data/example ż 大 김.onnx"
-	session, e := NewAdvancedSession(filePath, []string{"in"}, []string{"out"}, []Value{input}, []Value{output}, nil)
+	session, e := NewAdvancedSession(filePath, []string{"in"}, []string{"out"},
+		[]Value{input}, []Value{output}, nil)
 	if e != nil {
 		t.Fatalf("Failed creating session for %s: %s\n", filePath, e)
 	}
@@ -2323,4 +2755,327 @@ func TestCancelWithRunOptions_DynamicAdvancedSession(t *testing.T) {
 	} else {
 		t.Logf("Got expected termination error: %s", err)
 	}
+}
+
+func TestRunOptionsConfig(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	inputData := []int32{12, 21}
+	input, e := NewTensor(NewShape(1, 2), inputData)
+	if e != nil {
+		t.Fatalf("Error creating input tensor: %s\n", e)
+	}
+	defer input.Destroy()
+	output := newTestTensor[int32](t, NewShape(1))
+	defer output.Destroy()
+
+	filePath := "test_data/example ż 大 김.onnx"
+	session, e := NewAdvancedSession(filePath, []string{"in"}, []string{"out"},
+		[]Value{input}, []Value{output}, nil)
+	if e != nil {
+		t.Fatalf("Failed creating session for %s: %s\n", filePath, e)
+	}
+	defer session.Destroy()
+
+	ro, e := NewRunOptions()
+	if e != nil {
+		t.Fatalf("Error creating RunOptions: %s\n", e)
+	}
+	defer ro.Destroy()
+
+	// Shrinking the CPU arena is valid on any platform, since the CPU arena is
+	// enabled by default.
+	expectedEntry := "cpu:0"
+	configKey := "memory.enable_memory_arena_shrinkage"
+	e = ro.AddRunConfigEntry(configKey, expectedEntry)
+	if e != nil {
+		t.Fatalf("Error adding run config entry: %s\n", e)
+	}
+	entry, e := ro.GetRunConfigEntry(configKey)
+	if entry != expectedEntry {
+		t.Errorf("Did not get expected result for key %s: Expected %s, "+
+			"got %s\n", configKey, expectedEntry, entry)
+	}
+	e = session.RunWithOptions(ro)
+	if e != nil {
+		t.Fatalf("Error running with a run config entry set: %s\n", e)
+	}
+	expected := inputData[0] + inputData[1]
+	result := output.GetData()[0]
+	if result != expected {
+		t.Errorf("Incorrect result. Expected %d, got %d.\n", expected, result)
+	}
+
+	e = ro.AddRunConfigEntry("", "haha")
+	if e == nil {
+		t.Fatalf("Didn't get expected error when adding an option with an " +
+			"empty key.\n")
+	}
+	t.Logf("Got expected error when adding a bad RunConfigEntry: %s\n", e)
+	entry, e = ro.GetRunConfigEntry("WhateverOptionLOL")
+	if e == nil {
+		t.Fatalf("Didn't get expected error when getting a RunConfigEntry " +
+			"with an invalid key.\n")
+	}
+	t.Logf("Got expected error when getting a bad RunConfigEntry: %s\n", e)
+}
+
+func TestLoraAdapter(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	input, e := NewTensor(NewShape(1, 4), []float32{1, 2, 3, 4})
+	if e != nil {
+		t.Fatalf("Error creating input tensor: %s\n", e)
+	}
+	defer input.Destroy()
+	output := newTestTensor[float32](t, NewShape(1, 4))
+	defer output.Destroy()
+
+	filePath := "test_data/example_lora.onnx"
+	session, e := NewAdvancedSession(filePath, []string{"in"}, []string{"out"},
+		[]Value{input}, []Value{output}, nil)
+	if e != nil {
+		t.Fatalf("Failed creating session for %s: %s\n", filePath, e)
+	}
+	defer session.Destroy()
+
+	// Without an adapter, the network's LoRA parameters keep their zero-size
+	// defaults and contribute nothing to the output.
+	e = session.Run()
+	if e != nil {
+		t.Fatalf("Error running the network without an adapter: %s\n", e)
+	}
+	e = allFloatsEqual([]float32{90, 100, 110, 120}, output.GetData())
+	if e != nil {
+		t.Errorf("Incorrect result without an adapter: %s\n", e)
+	}
+
+	adapterPath := "test_data/example_lora.onnx_adapter"
+	adapter, e := NewLoraAdapter(adapterPath)
+	if e != nil {
+		t.Fatalf("Failed loading LoRA adapter %s: %s\n", adapterPath, e)
+	}
+	defer adapter.Destroy()
+
+	ro, e := NewRunOptions()
+	if e != nil {
+		t.Fatalf("Error creating RunOptions: %s\n", e)
+	}
+	defer ro.Destroy()
+	e = ro.AddActiveLoraAdapter(adapter)
+	if e != nil {
+		t.Fatalf("Error activating the LoRA adapter: %s\n", e)
+	}
+	e = session.RunWithOptions(ro)
+	if e != nil {
+		t.Fatalf("Error running with an active LoRA adapter: %s\n", e)
+	}
+	e = allFloatsEqual([]float32{440, 500, 560, 620}, output.GetData())
+	if e != nil {
+		t.Errorf("Incorrect result with an active adapter: %s\n", e)
+	}
+
+	// Loading the adapter from a buffer must behave the same as loading it
+	// from a file.
+	adapterData, e := os.ReadFile(adapterPath)
+	if e != nil {
+		t.Fatalf("Error reading %s: %s\n", adapterPath, e)
+	}
+	dataAdapter, e := NewLoraAdapterWithData(adapterData)
+	if e != nil {
+		t.Fatalf("Failed loading LoRA adapter from a buffer: %s\n", e)
+	}
+	defer dataAdapter.Destroy()
+	dataRO, e := NewRunOptions()
+	if e != nil {
+		t.Fatalf("Error creating RunOptions: %s\n", e)
+	}
+	defer dataRO.Destroy()
+	e = dataRO.AddActiveLoraAdapter(dataAdapter)
+	if e != nil {
+		t.Fatalf("Error activating the buffer-loaded adapter: %s\n", e)
+	}
+	e = session.RunWithOptions(dataRO)
+	if e != nil {
+		t.Fatalf("Error running with the buffer-loaded adapter: %s\n", e)
+	}
+	e = allFloatsEqual([]float32{440, 500, 560, 620}, output.GetData())
+	if e != nil {
+		t.Errorf("Incorrect result with the buffer-loaded adapter: %s\n", e)
+	}
+
+	_, e = NewLoraAdapter("test_data/nonexistent.onnx_adapter")
+	if e == nil {
+		t.Fatalf("Didn't get expected error when loading a nonexistent " +
+			"adapter file.\n")
+	}
+	t.Logf("Got expected error when loading a nonexistent adapter: %s\n", e)
+	_, e = NewLoraAdapterWithData([]byte{})
+	if e == nil {
+		t.Fatalf("Didn't get expected error when loading an adapter from " +
+			"an empty buffer.\n")
+	}
+	t.Logf("Got expected error when loading an empty adapter buffer: %s\n", e)
+}
+
+func TestSharedAllocator(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	memInfo, e := GetMemoryInfo()
+	if e != nil {
+		t.Fatalf("Error getting memory info: %s\n", e)
+	}
+
+	// Create and register a shared allocator with the environment
+	arenaCfg, e := NewArenaCfg(0, -1, -1, -1)
+	if e != nil {
+		t.Fatalf("Error creating arena config: %s\n", e)
+	}
+	defer arenaCfg.Destroy()
+
+	e = CreateAndRegisterAllocator(memInfo, arenaCfg)
+	if e != nil {
+		t.Fatalf("Error registering shared allocator: %s\n", e)
+	}
+	defer UnregisterAllocator(memInfo)
+
+	// Create session options that enable using environment allocators
+	options, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("Error creating session options: %s\n", e)
+	}
+	defer options.Destroy()
+	e = options.AddSessionConfigEntry("session.use_env_allocators", "1")
+	if e != nil {
+		t.Fatalf("Error setting session.use_env_allocators: %s\n", e)
+	}
+
+	// Create multiple sessions sharing the allocator
+	inputData := []int32{1, 2}
+	input, e := NewTensor(NewShape(1, 2), inputData)
+	if e != nil {
+		t.Fatalf("Error creating input tensor: %s\n", e)
+	}
+	defer input.Destroy()
+
+	modelPath := "test_data/example_big_fanout.onnx"
+
+	for i := 0; i < 3; i++ {
+		s, e := NewDynamicAdvancedSession(modelPath, nil, nil, options)
+		if e != nil {
+			t.Fatalf("Error creating session %d: %s\n", i, e)
+		}
+		s.Destroy()
+	}
+}
+
+// Sanity check for the plugin EP (V2) API: GetEpDevices must return without
+// error and produce well-formed (non-empty EpName, non-nil) entries when any
+// are present. We do not assert a specific count because the device list
+// depends on which execution providers were compiled into the loaded
+// onnxruntime shared library and which (if any) plugin libraries were
+// registered before the test.
+func TestGetEpDevices(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	devices, e := GetEpDevices()
+	if e != nil {
+		t.Fatalf("GetEpDevices returned an error: %s\n", e)
+	}
+	t.Logf("GetEpDevices returned %d device(s)\n", len(devices))
+	for i, d := range devices {
+		name := d.EpName()
+		vendor := d.EpVendor()
+		t.Logf("  device %d: ep=%q vendor=%q\n", i, name, vendor)
+		if name == "" {
+			t.Errorf("device %d: empty EpName\n", i)
+		}
+	}
+}
+
+// AppendExecutionProviderV2 must reject an empty device slice rather than
+// dereferencing a nil pointer in the C call.
+func TestAppendExecutionProviderV2EmptyDevices(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	opts, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("NewSessionOptions: %s\n", e)
+	}
+	defer opts.Destroy()
+
+	if e := opts.AppendExecutionProviderV2(nil, nil); e == nil {
+		t.Fatalf("expected error from AppendExecutionProviderV2 with nil " +
+			"devices, got nil\n")
+	}
+	if e := opts.AppendExecutionProviderV2([]EpDevice{}, nil); e == nil {
+		t.Fatalf("expected error from AppendExecutionProviderV2 with empty " +
+			"devices slice, got nil\n")
+	}
+}
+
+// AppendExecutionProviderV2 must reject a slice that contains the zero
+// EpDevice (nil C pointer) before reaching the C call. This guards against
+// callers manually constructing EpDevice{} values.
+func TestAppendExecutionProviderV2NilDevicePointer(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	opts, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("NewSessionOptions: %s\n", e)
+	}
+	defer opts.Destroy()
+
+	if e := opts.AppendExecutionProviderV2([]EpDevice{{}}, nil); e == nil {
+		t.Fatalf("expected error from AppendExecutionProviderV2 with zero " +
+			"EpDevice, got nil\n")
+	}
+}
+
+// When an EpDevice is available, AppendExecutionProviderV2 must surface ORT
+// errors as Go errors rather than panicking. Passing an obviously-bogus
+// option key is the simplest way to provoke a Status without needing a
+// specific plugin to be loaded. The test is skipped when no EpDevice is
+// available (e.g., a minimal onnxruntime build).
+func TestAppendExecutionProviderV2InvalidOption(t *testing.T) {
+	InitializeRuntime(t)
+	defer CleanupRuntime(t)
+
+	devices, e := GetEpDevices()
+	if e != nil {
+		t.Fatalf("GetEpDevices: %s\n", e)
+	}
+	if len(devices) == 0 {
+		t.Skipf("no EpDevices available on this build; skipping")
+	}
+
+	opts, e := NewSessionOptions()
+	if e != nil {
+		t.Fatalf("NewSessionOptions: %s\n", e)
+	}
+	defer opts.Destroy()
+
+	// Use a single device so all entries belong to the same EP, as required
+	// by SessionOptionsAppendExecutionProvider_V2.
+	e = opts.AppendExecutionProviderV2(devices[:1], map[string]string{
+		"definitely_not_a_real_option_key": "x",
+	})
+	// Either ORT rejects the unknown option (preferred) or it silently
+	// accepts it. Both are valid library behaviours; what we care about is
+	// that no panic / segfault occurs and that any reported error is a
+	// proper Go error string.
+	if e != nil {
+		t.Logf("ORT rejected bogus option as expected: %s\n", e)
+		if e.Error() == "" {
+			t.Errorf("error returned with empty message\n")
+		}
+		return
+	}
+	t.Logf("ORT silently accepted unknown option (also acceptable)\n")
 }

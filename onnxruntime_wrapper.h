@@ -155,10 +155,77 @@ OrtStatus *AppendExecutionProviderDirectML(OrtSessionOptions *o,
 OrtStatus *AppendExecutionProviderOpenVINOV2(OrtSessionOptions *o,
   const char **keys, const char **values, int num_keys);
 
-// Wraps ort_api->AppendExecutionProvider
+// Wraps ort_api->SessionOptionsAppendExecutionProvider
 OrtStatus *AppendExecutionProvider(OrtSessionOptions *o,
   const char *provider_name, const char **keys, const char **values,
   int num_keys);
+
+// Wraps ort_api->SetOptimizedModelFilePath. NOTE: takes an ORTCHAR_T*.
+OrtStatus *SetOptimizedModelFilePath(OrtSessionOptions *o,
+  char *path);
+
+// Wraps ort_api->EnableProfiling. NOTE: takes an ORTCHAR_T*.
+OrtStatus *EnableProfiling(OrtSessionOptions *o, char *path);
+
+// Wraps ort_api->DisableProfiling.
+OrtStatus *DisableProfiling(OrtSessionOptions *o);
+
+// Wraps ort_api->RegisterExecutionProviderLibrary
+OrtStatus *RegisterExecutionProviderLibrary(OrtEnv *env,
+  const char *registration_name, char *path);
+
+// Wraps ort_api->RegisterCustomOpsLibraryV2
+OrtStatus *RegisterCustomOpsLibraryV2(OrtSessionOptions *o,
+ const char *library_name);
+
+// Wraps ort_api->UnregisterExecutionProviderLibrary
+OrtStatus *UnregisterExecutionProviderLibrary(OrtEnv *env,
+  const char *registration_name);
+
+// Wraps ort_api->GetEpDevices. The returned array is owned by the OrtEnv and
+// must NOT be freed by the caller; the pointers inside it remain valid until
+// the corresponding plugin library is unregistered or the env is released.
+OrtStatus *GetEpDevices(OrtEnv *env,
+  const OrtEpDevice * const **out_devices, size_t *out_count);
+
+// Wraps ort_api->EpDevice_EpName.
+const char *EpDeviceEpName(const OrtEpDevice *device);
+
+// Wraps ort_api->EpDevice_EpVendor.
+const char *EpDeviceEpVendor(const OrtEpDevice *device);
+
+// Wraps ort_api->SessionOptionsAppendExecutionProvider_V2.
+OrtStatus *AppendExecutionProviderV2(OrtSessionOptions *o, OrtEnv *env,
+  const OrtEpDevice * const *ep_devices, size_t num_ep_devices,
+  const char **keys, const char **values, size_t num_keys);
+
+// Wraps ort_api->CreateArenaCfg
+OrtStatus *CreateArenaCfg(size_t max_mem, int arena_extend_strategy,
+  int initial_chunk_size_bytes, int max_dead_bytes_per_chunk,
+  OrtArenaCfg **out);
+
+// Wraps ort_api->CreateArenaCfgV2
+OrtStatus *CreateArenaCfgV2(const char *const *arena_config_keys,
+  const size_t *arena_config_values, size_t num_keys, OrtArenaCfg **out);
+
+// Wraps ort_api->ReleaseArenaCfg
+void ReleaseArenaCfg(OrtArenaCfg *ptr);
+
+// Wraps ort_api->CreateAndRegisterAllocator
+OrtStatus *CreateAndRegisterAllocator(OrtEnv *env,
+  const OrtMemoryInfo *mem_info, const OrtArenaCfg *arena_cfg);
+
+// Wraps ort_api->CreateAndRegisterAllocatorV2
+OrtStatus *CreateAndRegisterAllocatorV2(OrtEnv *env,
+  const char *provider_type, const OrtMemoryInfo *mem_info,
+  const OrtArenaCfg *arena_cfg, const char *const *provider_options_keys,
+  const char *const *provider_options_values, size_t num_keys);
+
+// Wraps ort_api->RegisterAllocator
+OrtStatus *RegisterAllocator(OrtEnv *env, OrtAllocator *allocator);
+
+// Wraps ort_api->UnregisterAllocator
+OrtStatus *UnregisterAllocator(OrtEnv *env, const OrtMemoryInfo *mem_info);
 
 // Creates an ORT session using the given model. The given options pointer may
 // be NULL; if it is, then we'll use default options.
@@ -191,6 +258,25 @@ void ReleaseRunOptions(OrtRunOptions *o);
 OrtStatus *RunOptionsSetTerminate(OrtRunOptions *o);
 // Wraps ort_api->RunOptionsUnsetTerminate
 OrtStatus *RunOptionsUnsetTerminate(OrtRunOptions *o);
+// Wraps ort_api->AddRunConfigEntry
+OrtStatus *AddRunConfigEntry(OrtRunOptions *o, char *key, char *value);
+// Wraps ort_api->GetRunConfigEntry
+const char *GetRunConfigEntry(OrtRunOptions *o, char *key);
+
+// LoraAdapter helpers
+// Wraps ort_api->CreateLoraAdapter, passing a NULL allocator so the adapter's
+// parameters stay on the CPU until a run requires them on a device.
+// NOTE: takes an ORTCHAR_T*.
+OrtStatus *CreateLoraAdapter(char *path, OrtLoraAdapter **out);
+// Wraps ort_api->CreateLoraAdapterFromArray, passing a NULL allocator like
+// CreateLoraAdapter.
+OrtStatus *CreateLoraAdapterFromArray(void *bytes, size_t num_bytes,
+  OrtLoraAdapter **out);
+// Wraps ort_api->ReleaseLoraAdapter
+void ReleaseLoraAdapter(OrtLoraAdapter *a);
+// Wraps ort_api->RunOptionsAddActiveLoraAdapter
+OrtStatus *RunOptionsAddActiveLoraAdapter(OrtRunOptions *o,
+  OrtLoraAdapter *a);
 
 // Wraps ort_api->RunWithBinding.
 OrtStatus *RunSessionWithBinding(OrtSession *session, OrtIoBinding *b);
@@ -242,17 +328,26 @@ OrtStatus *CreateOrtTensorWithShape(void *data, size_t data_size,
   int64_t *shape, int64_t shape_size, OrtMemoryInfo *mem_info,
   ONNXTensorElementDataType dtype, OrtValue **out);
 
+// Creates an OrtValue managed by onnxruntime's default allocator rather than
+// using Go-managed memory. Wraps ort_api->CreateTensorAsOrtValue.
+OrtStatus *CreateTensorAsOrtValue(int64_t *shape, int64_t shape_size,
+  ONNXTensorElementDataType dtype, OrtValue **out);
+
 // Wraps ort_api->GetTensorTypeAndShape
-OrtStatus *GetTensorTypeAndShape(const OrtValue *value, OrtTensorTypeAndShapeInfo **out);
+OrtStatus *GetTensorTypeAndShape(const OrtValue *value,
+  OrtTensorTypeAndShapeInfo **out);
 
 // Wraps ort_api->GetDimensionsCount
-OrtStatus *GetDimensionsCount(const OrtTensorTypeAndShapeInfo *info, size_t *out);
+OrtStatus *GetDimensionsCount(const OrtTensorTypeAndShapeInfo *info,
+  size_t *out);
 
 // Wraps ort_api->GetDimensions
-OrtStatus *GetDimensions(const OrtTensorTypeAndShapeInfo *info, int64_t *dim_values, size_t dim_values_length);
+OrtStatus *GetDimensions(const OrtTensorTypeAndShapeInfo *info,
+  int64_t *dim_values, size_t dim_values_length);
 
 // Wraps ort_api->GetTensorElementType
-OrtStatus *GetTensorElementType(const OrtTensorTypeAndShapeInfo *info, enum ONNXTensorElementDataType *out);
+OrtStatus *GetTensorElementType(const OrtTensorTypeAndShapeInfo *info,
+  enum ONNXTensorElementDataType *out);
 
 // Wraps ort_api->ReleaseTensorTypeAndShapeInfo
 void ReleaseTensorTypeAndShapeInfo(OrtTensorTypeAndShapeInfo *input);
@@ -334,6 +429,27 @@ OrtStatus *GetValueCount(OrtValue *v, size_t *out);
 // Wraps ort_api->CreateValue to create a map or a sequence.
 OrtStatus *CreateOrtValue(OrtValue **in, size_t num_values,
   enum ONNXType value_type, OrtValue **out);
+
+// Wraps ort_api->FillStringTensor
+OrtStatus *FillStringTensor(OrtValue *v, char **strings, size_t num_strings);
+
+// Wraps ort_api->GetStringTensorDataLength
+OrtStatus *GetStringTensorDataLength(OrtValue *v, size_t *length);
+
+// Wraps ort_api->GetStringTensorContent
+OrtStatus *GetStringTensorContent(OrtValue *v, void *data_buffer,
+  size_t data_size, size_t *offsets_buffer, size_t offsets_length);
+
+// Wraps ort_api->FillStringTensorElement
+OrtStatus *FillStringTensorElement(OrtValue *v, char *s, size_t index);
+
+// Wraps ort_api->GetStringTensorElementLength
+OrtStatus *GetStringTensorElementLength(OrtValue *v, size_t index,
+  size_t *result);
+
+// Wraps ort_api->GetStringTensorElement
+OrtStatus *GetStringTensorElement(OrtValue *v, size_t buffer_length,
+  size_t index, void *buffer);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -26,26 +26,26 @@ systems.
 Additionally, this library uses Go's recent addition of generics to support
 multiple Tensor data types; see the `NewTensor` or `NewEmptyTensor` functions.
 
-**IMPORTANT:** As of onnxruntime_go v1.12.0 or above, for CUDA acceleration we
-now require the use of CUDA 12.x and CuDNN 9.x (as required by onnxruntime
-v1.19.0+). Those wishing to stay on CUDA 11.8 should remain on onnxruntime_go
-v1.11.0 or below.
+Several accelerated execution providers (including TensorRT, CUDA and CoreML)
+are tested and confirmed to work with `onnxruntime_go`.  The "Requirements"
+portion of this README (below) has a few more details.
+
 
 Note on onnxruntime Library Versions
 ------------------------------------
 
-At the time of writing, this library uses version 1.22.0 of the onnxruntime
-C API headers.  So, it will probably only work with version 1.22.0 of the
+At the time of writing, this library uses version 1.29.0 of the onnxruntime
+C API headers.  So, it will probably only work with version 1.29.0 of the
 onnxruntime shared libraries, as well.  If you need to use a different version,
 or if I get behind on updating this repository, updating or changing the
 onnxruntime version should be fairly easy:
 
- 1. Replace the `onnxruntime_c_api.h` file with the version corresponding to
-    the onnxruntime version you wish to use.
+ 1. Replace the `onnxruntime_c_api.h` and `onnxruntime_ep_c_api.h` files with
+    the versions corresponding to the onnxruntime version you wish to use.
 
- 2. Replace the `test_data/onnxruntime.dll` (or `test_data/onnxruntime*.so`)
-    file with the version corresponding to the onnxruntime version you wish to
-    use.
+ 2. Replace the `test_data/onnxruntime.dll` (or `test_data/onnxruntime*.so`,
+    `test_data/onnxruntime*.dylib`) file with the version corresponding to the
+    onnxruntime version you wish to use.
 
  3. (If you care about DirectML support) Verify that the entries in the
     `DummyOrtDMLAPI` struct in `onnxruntime_wrapper.c` match the order in which
@@ -53,37 +53,43 @@ onnxruntime version should be fairly easy:
     header in the official repo.  See the comment on this struct in
     `onnxruntime_wrapper.c` for more information.
 
-Note that both the C API header and the shared library files are available to
+Note that both the C API headers and the shared library files are available to
 download from the releases page in the
 [official repo](https://github.com/microsoft/onnxruntime). Download the archive
-for the release you want to use, and extract it. The header file is located in
-the "include" subdirectory, and the shared library will be located in the "lib"
-subdirectory. (On Linux systems, you'll need the version of the .so with the
-appended version numbers, e.g., `libonnxruntime.so.1.22.0`, and _not_ the
+for the release you want to use, and extract it. The header files are located
+in the "include" subdirectory, and the shared library will be located in the
+"lib" subdirectory. (On Linux systems, you'll need the version of the .so with
+the appended version numbers, e.g., `libonnxruntime.so.1.29.0`, and _not_ the
 `libonnxruntime.so`, which is just a symbolic link.)  The archive will contain
 several other files containing C++ headers, debug symbols, and so on, but you
 shouldn't need anything other than the single onnxruntime shared library and
-`onnxruntime_c_api.h`.  (The exception is if you're wanting to enable GPU
-support, where you may need other shared-library files, such as
-`execution_providers_cuda.dll` and `execution_providers_shared.dll` on Windows.)
+the two `_c_api.h` header files.  (The exception is if you're wanting to enable
+GPU support, where you may need other shared-library files, such as
+`execution_providers_cuda.dll` and `execution_providers_shared.dll` (or their
+equivalents for Linux or OSX).
 
 
 Requirements
 ------------
 
-To use this library, you'll need a version of Go with cgo support.  If you are
-not using an amd64 version of Windows or Linux (or if you want to provide your
-own library for some other reason), you simply need to provide the correct path
-to the shared library when initializing the wrapper.  This is seen in the first
-few lines of the following example.
+To use this library, you'll need a version of Go with cgo support.  You'll also
+need a copy of the correct version of the onnxruntime shared library or DLL for
+your operating system and architecture.  Prior to initializing
+`onnxruntime_go`, you need to provide a path to this shared library.  See the
+first couple lines (i.e., `ort.SetSharedLibraryPath(...)`) of the following
+example.
 
-Note that if you want to use CUDA, you'll need to be using a version of the
-onnxruntime shared library with CUDA support, as well as be using a CUDA
-version supported by the underlying version of your onnxruntime library. For
-example, version 1.22.0 of the onnxruntime library only supports CUDA versions
-12.x. See
+If you want to use CUDA, you'll need to be using a version of the onnxruntime
+shared library with CUDA support, as well as be using a CUDA version supported
+by the underlying version of your onnxruntime library.  For example, version
+1.23.2 of the onnxruntime library only supports CUDA versions 12.x.  See
 [the onnxruntime CUDA support documentation](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)
 for more specifics.
+
+Similarly to CUDA, other execution providers have their own separate
+requirements.  All of these requirements are too numerous to document in this
+README.  Please ensure that you are successfully able to use your execution
+provider of choice in a python script before raising issues about it here.
 
 
 Example Usage
@@ -111,7 +117,7 @@ import (
 func main() {
     // This line _may_ be optional; by default the library will try to load
     // "onnxruntime.dll" on Windows, and "onnxruntime.so" on any other system.
-    // For stability, it is probably a good idea to always set this explicitly.
+    // For stability, programs should always set this explicitly.
     ort.SetSharedLibraryPath("path/to/onnxruntime.so")
 
     err := ort.InitializeEnvironment()
@@ -159,14 +165,24 @@ func main() {
 Deprecated APIs
 ---------------
 
-Older versions of this library used a typed `Session[T]` struct to keep track
-of sessions. In retrospect, associating type parameters with Sessions was
-unnecessary, and the `AdvancedSession` type, along with its associated APIs,
-was added to rectify this mistake.  For backwards compatibility, the old typed
-`Session[T]` and `DynamicSession[T]` types are still included and unlikely to
-be removed.  However, they now delegate their functionality to
-`AdvancedSession` internally.  New code should always favor using
-`AdvancedSession` directly.
+**Typed `Session[t]`:** Older versions of this library used a typed
+`Session[T]` struct to keep track of sessions. In retrospect, associating type
+parameters with Sessions was unnecessary, and the `AdvancedSession` type, along
+with its associated APIs, was added to rectify this mistake.  For backwards
+compatibility, the old typed `Session[T]` and `DynamicSession[T]` types are
+still included and unlikely to be removed.  However, they now delegate their
+functionality to `AdvancedSession` internally.  New code should always favor
+using `AdvancedSession` directly.
+
+**Onnxruntime's training API:** The training API has been deprecated as of
+onnxruntime version 1.20.  Rather than continuing to maintain wrappers for a
+deprecated API, `onnxruntime_go` has replaced the wrapper functions for the
+training API with stubs that return an error.  Users who need to continue to
+use the training API will need to use an older version.  For example the
+following versions should be compatible with training:
+
+ - Version `v1.12.1` of `onnxruntime_go`, and
+ - Version 1.19.2 of `onnxruntime`.
 
 
 Statically Linking ONNX Runtime
@@ -259,17 +275,3 @@ load a library from `test_data/`. So, if you are using one of these systems or
 want accelerator-related tests to run, you should set the environment variable
 to the path to the onnxruntime shared library.  Afterwards, `go test -v` should
 run and pass.
-
-
-Training API Support
---------------------
-
-The training API has been deprecated as of onnxruntime version 1.20.  Rather
-than continuing to maintain wrappers for a deprecated API, `onnxruntime_go` has
-replaced the wrapper functions for the training API with stubs that return an
-error.  Users who need to continue to use the training API will need to use an
-older version.  For example the following versions should be compatible with
-training:
-
- - Version `v1.12.1` of `onnxruntime_go`, and
- - Version 1.19.2 of `onnxruntime`.

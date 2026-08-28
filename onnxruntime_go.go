@@ -274,6 +274,293 @@ func SetEnvironmentLogLevel(level LoggingLevel) error {
 	return nil
 }
 
+// RegisterExecutionProviderLibrary registers a dynamic execution provider
+// library. The library must export 'CreateEpFactories' and 'ReleaseEpFactory'
+// functions.
+func RegisterExecutionProviderLibrary(registrationName, libraryPath string) error {
+	if !IsInitialized() {
+		return NotInitializedError
+	}
+	cName := C.CString(registrationName)
+	defer C.free(unsafe.Pointer(cName))
+	cPath, err := createOrtCharString(libraryPath)
+	if err != nil {
+		return err
+	}
+	defer C.free(unsafe.Pointer(cPath))
+	status := C.RegisterExecutionProviderLibrary(ortEnv, cName, cPath)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// UnregisterExecutionProviderLibrary unregisters a dynamic execution provider
+// library previously registered with RegisterExecutionProviderLibrary.
+func UnregisterExecutionProviderLibrary(registrationName string) error {
+	if !IsInitialized() {
+		return NotInitializedError
+	}
+	cName := C.CString(registrationName)
+	defer C.free(unsafe.Pointer(cName))
+	status := C.UnregisterExecutionProviderLibrary(ortEnv, cName)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// EpDevice is an opaque handle to an OrtEpDevice: a single (execution
+// provider, hardware device) pair surfaced by an execution-provider plugin.
+//
+// EpDevice values returned from GetEpDevices are owned by the OrtEnv. Callers
+// must NOT call any release function on them; the underlying OrtEpDevice
+// remains valid until the originating plugin library is unregistered (via
+// UnregisterExecutionProviderLibrary) or the runtime environment is destroyed.
+type EpDevice struct {
+	p *C.OrtEpDevice
+}
+
+// EpName returns the execution provider name that owns this device, e.g.
+// "QNNExecutionProvider" or "OpenVINOExecutionProvider".
+func (d EpDevice) EpName() string {
+	if d.p == nil {
+		return ""
+	}
+	return C.GoString(C.EpDeviceEpName(d.p))
+}
+
+// EpVendor returns the execution provider's vendor string, e.g. "Microsoft"
+// or "Qualcomm".
+func (d EpDevice) EpVendor() string {
+	if d.p == nil {
+		return ""
+	}
+	return C.GoString(C.EpDeviceEpVendor(d.p))
+}
+
+// GetEpDevices returns the list of OrtEpDevice instances known to the
+// runtime, including those contributed by plugin execution providers loaded
+// via RegisterExecutionProviderLibrary. The returned EpDevices remain valid
+// until the corresponding plugin library is unregistered or the environment
+// is destroyed.
+func GetEpDevices() ([]EpDevice, error) {
+	if !IsInitialized() {
+		return nil, NotInitializedError
+	}
+	var raw **C.OrtEpDevice
+	var count C.size_t
+	status := C.GetEpDevices(ortEnv,
+		(***C.OrtEpDevice)(unsafe.Pointer(&raw)), &count)
+	if status != nil {
+		return nil, statusToError(status)
+	}
+	n := int(count)
+	if n == 0 || raw == nil {
+		return nil, nil
+	}
+	// raw points to an array of n const OrtEpDevice* owned by the env.
+	devices := make([]EpDevice, n)
+	src := unsafe.Slice(raw, n)
+	for i := 0; i < n; i++ {
+		devices[i] = EpDevice{p: src[i]}
+	}
+	return devices, nil
+}
+
+// AppendExecutionProviderV2 attaches a plugin execution provider to these
+// session options using one or more OrtEpDevice instances obtained from
+// GetEpDevices. All provided devices must belong to the same execution
+// provider (they are different hardware targets within that EP).
+//
+// This is the plugin-aware path; use it for any execution provider loaded
+// through RegisterExecutionProviderLibrary (QNN, newer OpenVINO, etc.). For
+// execution providers compiled into libonnxruntime, use the dedicated
+// wrappers (AppendExecutionProviderCUDA, AppendExecutionProviderCoreMLV2,
+// ...) or the V1 string-based AppendExecutionProvider.
+//
+// Wraps the C API SessionOptionsAppendExecutionProvider_V2.
+func (o *SessionOptions) AppendExecutionProviderV2(devices []EpDevice,
+	options map[string]string) error {
+	if len(devices) == 0 {
+		return fmt.Errorf("AppendExecutionProviderV2 requires at least one EpDevice")
+	}
+	for i, d := range devices {
+		if d.p == nil {
+			return fmt.Errorf("AppendExecutionProviderV2: devices[%d] "+
+				"is the zero EpDevice", i)
+		}
+	}
+
+	arr := make([]*C.OrtEpDevice, len(devices))
+	for i, d := range devices {
+		arr[i] = d.p
+	}
+	var arrPtr **C.OrtEpDevice
+	if len(arr) != 0 {
+		// Avoid dereferencing arr[0] if the array is empty, same as with the options map.
+		arrPtr = &(arr[0])
+	}
+
+	var keysPtr, valuesPtr **C.char
+	if len(options) != 0 {
+		keys, values := mapToCStrings(options)
+		defer freeCStrings(keys)
+		defer freeCStrings(values)
+		keysPtr = &(keys[0])
+		valuesPtr = &(values[0])
+	}
+
+	status := C.AppendExecutionProviderV2(o.o, ortEnv, arrPtr, C.size_t(len(arr)),
+		keysPtr, valuesPtr, C.size_t(len(options)))
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// ArenaCfg wraps OrtArenaCfg for arena-based allocator configuration.
+type ArenaCfg struct {
+	c *C.OrtArenaCfg
+}
+
+// NewArenaCfg creates a configuration object for an arena-based allocator.
+// maxMem: Use 0 for ORT default.
+// arenaExtendStrategy: Use -1 for ORT default, 0 = kNextPowerOfTwo, 1 = kSameAsRequested.
+// initialChunkSize: Use -1 for ORT default.
+// maxDeadBytesPerChunk: Use -1 for ORT default.
+func NewArenaCfg(maxMem int, arenaExtendStrategy, initialChunkSize, maxDeadBytesPerChunk int) (*ArenaCfg, error) {
+	if !IsInitialized() {
+		return nil, NotInitializedError
+	}
+	var c *C.OrtArenaCfg
+	status := C.CreateArenaCfg(C.size_t(maxMem), C.int(arenaExtendStrategy),
+		C.int(initialChunkSize), C.int(maxDeadBytesPerChunk), &c)
+	if status != nil {
+		return nil, statusToError(status)
+	}
+	return &ArenaCfg{c: c}, nil
+}
+
+// NewArenaCfgV2 creates a configuration object for an arena-based allocator
+// using string-based configuration keys and size_t values.
+func NewArenaCfgV2(configs map[string]int) (*ArenaCfg, error) {
+	if !IsInitialized() {
+		return nil, NotInitializedError
+	}
+	numKeys := len(configs)
+	if numKeys == 0 {
+		return NewArenaCfg(0, -1, -1, -1)
+	}
+	keys := make([]*C.char, 0, numKeys)
+	values := make([]C.size_t, 0, numKeys)
+	for k, v := range configs {
+		keys = append(keys, C.CString(k))
+		values = append(values, C.size_t(v))
+	}
+	defer func() {
+		for _, k := range keys {
+			C.free(unsafe.Pointer(k))
+		}
+	}()
+
+	var c *C.OrtArenaCfg
+	status := C.CreateArenaCfgV2(&keys[0], &values[0], C.size_t(numKeys), &c)
+	if status != nil {
+		return nil, statusToError(status)
+	}
+	return &ArenaCfg{c: c}, nil
+}
+
+// Destroy releases the underlying OrtArenaCfg.
+func (c *ArenaCfg) Destroy() {
+	if c.c != nil {
+		C.ReleaseArenaCfg(c.c)
+		c.c = nil
+	}
+}
+
+// CreateAndRegisterAllocator creates an allocator and registers it with the
+// environment, enabling sharing between multiple sessions.
+func CreateAndRegisterAllocator(memInfo *C.OrtMemoryInfo, arenaCfg *ArenaCfg) error {
+	if !IsInitialized() {
+		return NotInitializedError
+	}
+	var cArenaCfg *C.OrtArenaCfg
+	if arenaCfg != nil {
+		cArenaCfg = arenaCfg.c
+	}
+	status := C.CreateAndRegisterAllocator(ortEnv, memInfo, cArenaCfg)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// CreateAndRegisterAllocatorV2 creates an allocator of a specific provider
+// type and registers it with the environment.
+func CreateAndRegisterAllocatorV2(providerType string, memInfo *C.OrtMemoryInfo, arenaCfg *ArenaCfg, options map[string]string) error {
+	if !IsInitialized() {
+		return NotInitializedError
+	}
+	var cArenaCfg *C.OrtArenaCfg
+	if arenaCfg != nil {
+		cArenaCfg = arenaCfg.c
+	}
+	cProviderType := C.CString(providerType)
+	defer C.free(unsafe.Pointer(cProviderType))
+
+	var keysPtr, valuesPtr **C.char
+	numOptions := len(options)
+	if numOptions > 0 {
+		keys, values := mapToCStrings(options)
+		defer freeCStrings(keys)
+		defer freeCStrings(values)
+		keysPtr = &keys[0]
+		valuesPtr = &values[0]
+	}
+
+	status := C.CreateAndRegisterAllocatorV2(ortEnv, cProviderType, memInfo,
+		cArenaCfg, keysPtr, valuesPtr, C.size_t(numOptions))
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// UnregisterAllocator unregisters a previously registered allocator.
+func UnregisterAllocator(memInfo *C.OrtMemoryInfo) error {
+	if !IsInitialized() {
+		return NotInitializedError
+	}
+	status := C.UnregisterAllocator(ortEnv, memInfo)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// RegisterAllocator registers a custom allocator with the environment.
+func RegisterAllocator(allocator *C.OrtAllocator) error {
+	if !IsInitialized() {
+		return NotInitializedError
+	}
+	status := C.RegisterAllocator(ortEnv, allocator)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// GetMemoryInfo returns the environment-wide OrtMemoryInfo. This can be used
+// when registering shared allocators.
+func GetMemoryInfo() (*C.OrtMemoryInfo, error) {
+	if !IsInitialized() {
+		return nil, NotInitializedError
+	}
+	return ortMemoryInfo, nil
+}
+
 // The Shape type holds the shape of the tensors used by the network input and
 // outputs.
 type Shape []int64
@@ -523,40 +810,40 @@ func NewTensor[T TensorData](s Shape, data []T) (*Tensor[T], error) {
 type TensorElementDataType int
 
 const (
-	TensorElementDataTypeUndefined = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
-	TensorElementDataTypeFloat     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-	TensorElementDataTypeUint8     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
-	TensorElementDataTypeInt8      = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
-	TensorElementDataTypeUint16    = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
-	TensorElementDataTypeInt16     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
-	TensorElementDataTypeInt32     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
-	TensorElementDataTypeInt64     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-	TensorElementDataTypeString    = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING
-	TensorElementDataTypeBool      = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
-	TensorElementDataTypeFloat16   = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
-	TensorElementDataTypeDouble    = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
-	TensorElementDataTypeUint32    = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
-	TensorElementDataTypeUint64    = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
-
-	// Not supported by onnxruntime (as of onnxruntime version 1.22.0)
-	TensorElementDataTypeComplex64 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64
-	// Not supported by onnxruntime (as of onnxruntime version 1.22.0)
-	TensorElementDataTypeComplex128 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128
-
-	// Non-IEEE floating-point format based on IEEE754 single-precision
-	TensorElementDataTypeBFloat16 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
-
-	// 8-bit float types, introduced in onnx 1.14.  See
-	// https://onnx.ai/onnx/technical/float8.html
-	TensorElementDataTypeFloat8E4M3FN   = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN
-	TensorElementDataTypeFloat8E4M3FNUZ = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ
-	TensorElementDataTypeFloat8E5M2     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2
-	TensorElementDataTypeFloat8E5M2FNUZ = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ
-
-	// Int4 types were introduced in ONNX 1.16. See
-	// https://onnx.ai/onnx/technical/int4.html
-	TensorElementDataTypeUint4 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4
-	TensorElementDataTypeInt4  = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4
+	TensorElementDataTypeUndefined  = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
+	TensorElementDataTypeFloat      = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT  // maps to c type float
+	TensorElementDataTypeUint8      = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8  // maps to c type uint8_t
+	TensorElementDataTypeInt8       = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8   // maps to c type int8_t
+	TensorElementDataTypeUint16     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16 // maps to c type uint16_t
+	TensorElementDataTypeInt16      = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16  // maps to c type int16_t
+	TensorElementDataTypeInt32      = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32  // maps to c type int32_t
+	TensorElementDataTypeInt64      = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64  // maps to c type int64_t
+	TensorElementDataTypeString     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING // maps to c++ type std::string
+	TensorElementDataTypeBool       = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
+	TensorElementDataTypeFloat16    = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
+	TensorElementDataTypeDouble     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE     // maps to c type double
+	TensorElementDataTypeUint32     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32     // maps to c type uint32_t
+	TensorElementDataTypeUint64     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64     // maps to c type uint64_t
+	TensorElementDataTypeComplex64  = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64  // complex with float32 real and imaginary components
+	TensorElementDataTypeComplex128 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128 // complex with float64 real and imaginary components
+	TensorElementDataTypeBFloat16   = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16   // Non-IEEE floating-point format based on IEEE754 single-precision
+	// float 8 types were introduced in onnx 1.14, see https://onnx.ai/onnx/technical/float8.html
+	TensorElementDataTypeFloat8E4M3FN   = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN   // Non-IEEE floating-point format based on IEEE754 single-precision
+	TensorElementDataTypeFloat8E4M3FNUZ = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ // Non-IEEE floating-point format based on IEEE754 single-precision
+	TensorElementDataTypeFloat8E5M2     = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2     // Non-IEEE floating-point format based on IEEE754 single-precision
+	TensorElementDataTypeFloat8E5M2FNUZ = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ // Non-IEEE floating-point format based on IEEE754 single-precision
+	// Int4 types were introduced in ONNX 1.16. See https://onnx.ai/onnx/technical/int4.html
+	TensorElementDataTypeUint4 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 // maps to a pair of packed uint4 values (size == 1 byte)
+	TensorElementDataTypeInt4  = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4  // maps to a pair of packed int4 values (size == 1 byte)
+	// See https://onnx.ai/onnx/technical/float4.html for information about
+	// the float4 types.
+	TensorElementDataTypeFloat4E2M1 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1
+	// 4 int2 elements are packed into a single byte. See
+	// https://onnx.ai/onnx/technical/int2.html for more information.
+	TensorElementDataTypeUint2 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2
+	TensorElementDataTypeInt2  = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2
+	// Non-IEEE floating-point format, all values are powers of two.
+	TensorElementDataTypeFloat8E8M0 = C.ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0
 )
 
 func (t TensorElementDataType) String() string {
@@ -607,6 +894,14 @@ func (t TensorElementDataType) String() string {
 		return "ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4"
 	case TensorElementDataTypeInt4:
 		return "ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4"
+	case TensorElementDataTypeFloat4E2M1:
+		return "ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1"
+	case TensorElementDataTypeUint2:
+		return "ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2"
+	case TensorElementDataTypeInt2:
+		return "ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2"
+	case TensorElementDataTypeFloat8E8M0:
+		return "ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0"
 	}
 	return fmt.Sprintf("Unknown tensor element data type: %d", int(t))
 }
@@ -1031,6 +1326,177 @@ func (t *CustomDataTensor) GetData() []byte {
 	return t.data
 }
 
+// This represents an onnxruntime tensor containing strings. This still
+// satisfies the Value interface, but has several important differences with
+// Tensor[T] instances for numerical values. Most notably,
+// StringTensor.GetContents() returns a _copy_ of the tensor's contents, and
+// modifying these strings will not modify the contents of the underlying
+// tensor. Instead, users must use StringTensor.SetElement(...) or
+// StringTensor.SetContents(...) to modify the contents of an existing string
+// tensor.
+type StringTensor struct {
+	shape    Shape
+	ortValue *C.OrtValue
+}
+
+// Creates and returns a string tensor. The contents are _not_ initialized yet,
+// and must be initialized using SetContents or, less efficiently, using
+// SetElement to set each string individually. As with all Values,
+// StringTensors must be freed using Destroy() when no longer needed.
+func NewStringTensor(shape Shape) (*StringTensor, error) {
+	if !IsInitialized() {
+		return nil, NotInitializedError
+	}
+	e := shape.Validate()
+	if e != nil {
+		return nil, fmt.Errorf("Invalid string tensor shape: %w", e)
+	}
+
+	var ortValue *C.OrtValue
+	status := C.CreateTensorAsOrtValue((*C.int64_t)(&shape[0]),
+		C.int64_t(len(shape)), C.ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING,
+		&ortValue)
+	if status != nil {
+		return nil, statusToError(status)
+	}
+
+	return &StringTensor{
+		shape:    shape.Clone(),
+		ortValue: ortValue,
+	}, nil
+}
+
+// This sets all of the strings in t to the contents from the flattened slice
+// of strings. The length of the contents slice must match
+// t.GetShape().FlattenedSize(), otherwise this will return an error.
+func (t *StringTensor) SetContents(contents []string) error {
+	if int64(len(contents)) != t.shape.FlattenedSize() {
+		// I'm sure the C API detects this as well, but we can check for it
+		// here before needing to allocate a bunch of strings.
+		return fmt.Errorf("Was provided %d strings, but %d are required",
+			len(contents), t.shape.FlattenedSize())
+	}
+	if len(contents) == 0 {
+		return nil
+	}
+	cStrings := make([]*C.char, len(contents))
+	for i, s := range contents {
+		cStrings[i] = C.CString(s)
+	}
+	defer freeCStrings(cStrings)
+	status := C.FillStringTensor(t.ortValue, &(cStrings[0]),
+		C.size_t(len(contents)))
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// Sets the string at the flattened index in t to s.
+func (t *StringTensor) SetElement(index int64, s string) error {
+	cString := C.CString(s)
+	defer C.free(unsafe.Pointer(cString))
+	status := C.FillStringTensorElement(t.ortValue, cString, C.size_t(index))
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// Returns all contents of the string tensor, in order by flattened index.
+// If you need to get all contents in the tensor, this should be more efficient
+// than using GetElement(...) to retrieve all strings individually. This
+// copies the tensor's contents; modifying the returned slice will not modify
+// the tensor.
+func (t *StringTensor) GetContents() ([]string, error) {
+	var dataSize C.size_t
+	status := C.GetStringTensorDataLength(t.ortValue, &dataSize)
+	if status != nil {
+		return nil, statusToError(status)
+	}
+	if dataSize == 0 {
+		// A quick optimization where all the strings are empty, avoids needing
+		// to mess around with nil pointers, too.
+		return make([]string, t.shape.FlattenedSize()), nil
+	}
+	// I'm assuming nonzero data length implies a non-empty shape.
+	dataBuffer := make([]byte, dataSize)
+	offsets := make([]C.size_t, t.shape.FlattenedSize())
+
+	// Invoke the C API
+	status = C.GetStringTensorContent(t.ortValue,
+		unsafe.Pointer(&(dataBuffer[0])), dataSize, &(offsets[0]),
+		C.size_t(len(offsets)))
+	if status != nil {
+		return nil, statusToError(status)
+	}
+
+	// Extract the individual strings from the data buffer using their offsets.
+	toReturn := make([]string, len(offsets))
+	for i := range offsets {
+		if i == (len(offsets) - 1) {
+			// The last string doesn't have an end offset; it just goes to the
+			// end of the buffer.
+			toReturn[i] = string(dataBuffer[offsets[i]:])
+			break
+		}
+		toReturn[i] = string(dataBuffer[offsets[i]:offsets[i+1]])
+	}
+
+	return toReturn, nil
+}
+
+// Returns a single string from t, at the given flattened index.
+func (t *StringTensor) GetElement(index int64) (string, error) {
+	var length C.size_t
+	status := C.GetStringTensorElementLength(t.ortValue, C.size_t(index),
+		&length)
+	if status != nil {
+		return "", statusToError(status)
+	}
+	if length == 0 {
+		return "", nil
+	}
+	data := make([]byte, length)
+	status = C.GetStringTensorElement(t.ortValue, length, C.size_t(index),
+		unsafe.Pointer(&(data[0])))
+	if status != nil {
+		return "", statusToError(status)
+	}
+	return string(data), nil
+}
+
+// Always returns C.ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING
+func (t *StringTensor) DataType() C.ONNXTensorElementDataType {
+	return C.ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING
+}
+
+func (t *StringTensor) GetShape() Shape {
+	return t.shape.Clone()
+}
+
+func (t *StringTensor) Destroy() error {
+	C.ReleaseOrtValue(t.ortValue)
+	t.ortValue = nil
+	t.shape = nil
+	return nil
+}
+
+func (t *StringTensor) GetInternals() *ValueInternalData {
+	return &ValueInternalData{
+		ortValue: t.ortValue,
+	}
+}
+
+// ZeroContents() is unsupported for string tensors. To clear all strings, use
+// err := t.SetContents(make([]string, t.GetShape().FlattenedSize())) instead.
+func (t *StringTensor) ZeroContents() {
+}
+
+func (t *StringTensor) GetONNXType() ONNXType {
+	return ONNXTypeTensor
+}
+
 // Scalar is like a tensor but the underlying go slice is of length 1 and it
 // has no dimension. It was introduced for use with the training API, but
 // remains supported since it may be useful apart from the training API.
@@ -1197,6 +1663,13 @@ func (o *CUDAProviderOptions) Destroy() error {
 // configured, then passed to SessionOptions.AppendExecutionProviderCUDA.)
 // The caller must call the Destroy() function on the returned struct when it's
 // no longer needed.
+//
+// WARNING: There is a known issue where the CUDA execution provider will
+// overwrite Go's default signal handlers. Users may need to back up and
+// re-install Go's signal handlers prior to initializing or using the CUDA
+// execution provider.
+// See https://github.com/yalue/onnxruntime_go/issues/140 for some discussion
+// of this issue.
 func NewCUDAProviderOptions() (*CUDAProviderOptions, error) {
 	if !IsInitialized() {
 		return nil, NotInitializedError
@@ -1463,6 +1936,13 @@ func (o *SessionOptions) SetMemPattern(isEnabled bool) error {
 // the session to use CUDA. Returns an error if your device (or onnxruntime
 // library) does not support CUDA. The CUDAProviderOptions struct can be
 // destroyed after this.
+//
+// WARNING: There is a known issue where the CUDA execution provider will
+// overwrite Go's default signal handlers. Users may need to back up and
+// re-install Go's signal handlers prior to initializing or using the CUDA
+// execution provider.
+// See https://github.com/yalue/onnxruntime_go/issues/140 for some discussion
+// of this issue.
 func (o *SessionOptions) AppendExecutionProviderCUDA(
 	cudaOptions *CUDAProviderOptions) error {
 	status := C.AppendExecutionProviderCUDAV2(o.o, cudaOptions.o)
@@ -1501,31 +1981,24 @@ func (o *SessionOptions) AppendExecutionProviderCoreML(flags uint32) error {
 	return nil
 }
 
-// AppendExecutionProviderCoreMLV2 is the new API for adding CoreML provider to ONNX Runtime.
-// This is the recommended way to add CoreML provider as of ONNX Runtime 1.20.0.
+// AppendExecutionProviderCoreMLV2 is the new API for adding CoreML provider to
+// ONNX Runtime. This is the recommended way to add CoreML provider as of
+// onnxruntime 1.20.0.
 //
-// For CoreML options, see:
+// For the list of supported options, see:
 // https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html
 func (o *SessionOptions) AppendExecutionProviderCoreMLV2(options map[string]string) error {
-
-	// Handle case with no options
-	if len(options) == 0 {
-		status := C.AppendExecutionProviderCoreMLV2(o.o, nil, nil, 0)
-		if status != nil {
-			return statusToError(status)
-		}
-		return nil
+	var keysPtr, valuesPtr **C.char
+	if len(options) != 0 {
+		keys, values := mapToCStrings(options)
+		defer freeCStrings(keys)
+		defer freeCStrings(values)
+		keysPtr = &(keys[0])
+		valuesPtr = &(values[0])
 	}
 
-	// Convert map to arrays of keys and values
-	keys, values := mapToCStrings(options)
-	defer freeCStrings(keys)
-	defer freeCStrings(values)
-
-	// Call C function
-	status := C.AppendExecutionProviderCoreMLV2(o.o,
-		&keys[0], &values[0], C.size_t(len(options)))
-
+	status := C.AppendExecutionProviderCoreMLV2(o.o, keysPtr, valuesPtr,
+		C.size_t(len(options)))
 	if status != nil {
 		return statusToError(status)
 	}
@@ -1595,6 +2068,61 @@ func (o *SessionOptions) AppendExecutionProvider(providerName string,
 	return nil
 }
 
+// Wraps the SetOptimizedModelFilePath API function for these session options.
+// Onnxruntime will save the optimized model file to the given path, after
+// graph-level transformations.
+func (o *SessionOptions) SetOptimizedModelFilePath(path string) error {
+	ortCharPath, e := createOrtCharString(path)
+	if e != nil {
+		return fmt.Errorf("Error encoding optimized model file path: %w", e)
+	}
+	defer C.free(unsafe.Pointer(ortCharPath))
+	status := C.SetOptimizedModelFilePath(o.o, ortCharPath)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// Enables profiling for these session options. The profile will be a JSON file
+// with the given path prefix.
+func (o *SessionOptions) EnableProfiling(profileFilePrefix string) error {
+	ortCharPath, e := createOrtCharString(profileFilePrefix)
+	if e != nil {
+		return fmt.Errorf("Error encoding profile path prefix: %w", e)
+	}
+	defer C.free(unsafe.Pointer(ortCharPath))
+	status := C.EnableProfiling(o.o, ortCharPath)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// Disables profiling for these session options.
+func (o *SessionOptions) DisableProfiling() error {
+	status := C.DisableProfiling(o.o)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// Register custom ops from a shared library.
+func (o *SessionOptions) RegisterCustomOpsLibrary(path string) error {
+	ortCharPath, e := createOrtCharString(path)
+	if e != nil {
+		return fmt.Errorf("Unable to convert path to C path: %w", e)
+	}
+	defer C.free(unsafe.Pointer(ortCharPath))
+	status := C.RegisterCustomOpsLibraryV2(o.o, ortCharPath)
+	if status != nil {
+		return statusToError(status)
+	}
+
+	return nil
+}
+
 // Initializes and returns a SessionOptions struct, used when setting options
 // in new AdvancedSession instances. The caller must call the Destroy()
 // function on the returned struct when it's no longer needed.
@@ -1632,9 +2160,6 @@ func NewRunOptions() (*RunOptions, error) {
 
 // Destroy releases the underlying OrtRunOptions.
 func (o *RunOptions) Destroy() error {
-	if o == nil || o.o == nil {
-		return fmt.Errorf("The RunOptions are not initialized")
-	}
 	C.ReleaseRunOptions(o.o)
 	o.o = nil
 	return nil
@@ -1642,9 +2167,6 @@ func (o *RunOptions) Destroy() error {
 
 // Terminate sets the terminate flag so any ongoing Run using this RunOptions fails quickly.
 func (o *RunOptions) Terminate() error {
-	if o == nil || o.o == nil {
-		return fmt.Errorf("The RunOptions are not initialized")
-	}
 	status := C.RunOptionsSetTerminate(o.o)
 	if status != nil {
 		return statusToError(status)
@@ -1654,10 +2176,104 @@ func (o *RunOptions) Terminate() error {
 
 // UnsetTerminate clears the terminate flag so this RunOptions can be reused.
 func (o *RunOptions) UnsetTerminate() error {
-	if o == nil || o.o == nil {
-		return fmt.Errorf("The RunOptions are not initialized")
-	}
 	status := C.RunOptionsUnsetTerminate(o.o)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// AddRunConfigEntry sets a run configuration key to the given value. See the
+// onnxruntime_run_options_config_keys.h file in the onnxruntime sources for
+// documentation on valid keys and values. If the key was already set, this
+// will overwrite its old setting with the given value.
+func (o *RunOptions) AddRunConfigEntry(key, value string) error {
+	cKey := C.CString(key)
+	defer C.free(unsafe.Pointer(cKey))
+	cValue := C.CString(value)
+	defer C.free(unsafe.Pointer(cValue))
+	status := C.AddRunConfigEntry(o.o, cKey, cValue)
+	if status != nil {
+		return statusToError(status)
+	}
+	return nil
+}
+
+// The counterpart to AddRunConfigEntry,
+func (o *RunOptions) GetRunConfigEntry(key string) (string, error) {
+	cKey := C.CString(key)
+	defer C.free(unsafe.Pointer(cKey))
+	cValue := C.GetRunConfigEntry(o.o, cKey)
+	if cValue == nil {
+		return "", fmt.Errorf("GetRunConfigEntry returned NULL for key \"%s\"",
+			key)
+	}
+	nonConstPtr := (*C.char)(unsafe.Pointer(cValue))
+	return C.GoString(nonConstPtr), nil
+}
+
+// A wrapper around the OrtLoraAdapter C struct, holding a set of LoRA
+// parameters that can be activated on a RunOptions instance. Must be freed by
+// calling Destroy() on it when it's no longer needed.
+type LoraAdapter struct {
+	l *C.OrtLoraAdapter
+}
+
+// NewLoraAdapter loads the LoRA adapter file (in onnxruntime's .onnx_adapter
+// format) at the given path. The adapter's parameters stay on the CPU, and are
+// only copied to a device if the model requires it at inference time. The
+// caller must call Destroy() on the returned LoraAdapter when it's no longer
+// needed.
+func NewLoraAdapter(adapterFilePath string) (*LoraAdapter, error) {
+	if !IsInitialized() {
+		return nil, NotInitializedError
+	}
+	cPath, e := createOrtCharString(adapterFilePath)
+	if e != nil {
+		return nil, fmt.Errorf("Error encoding adapter file path: %w", e)
+	}
+	defer C.free(unsafe.Pointer(cPath))
+	var l *C.OrtLoraAdapter
+	status := C.CreateLoraAdapter(cPath, &l)
+	if status != nil {
+		return nil, statusToError(status)
+	}
+	return &LoraAdapter{l: l}, nil
+}
+
+// The same as NewLoraAdapter, but takes a slice of bytes containing the
+// .onnx_adapter data rather than a file path.
+func NewLoraAdapterWithData(adapterData []byte) (*LoraAdapter, error) {
+	if !IsInitialized() {
+		return nil, NotInitializedError
+	}
+	if len(adapterData) == 0 {
+		return nil, fmt.Errorf("Missing adapter data")
+	}
+	var l *C.OrtLoraAdapter
+	status := C.CreateLoraAdapterFromArray(unsafe.Pointer(&(adapterData[0])),
+		C.size_t(len(adapterData)), &l)
+	if status != nil {
+		return nil, statusToError(status)
+	}
+	return &LoraAdapter{l: l}, nil
+}
+
+// Destroy releases the underlying OrtLoraAdapter. Don't destroy a LoraAdapter
+// while it's still active on a RunOptions instance that may still be used.
+func (l *LoraAdapter) Destroy() error {
+	C.ReleaseLoraAdapter(l.l)
+	l.l = nil
+	return nil
+}
+
+// AddActiveLoraAdapter adds the given LoRA adapter to the list of adapters
+// that are active during any Run using this RunOptions instance. More than one
+// adapter can be active at the same time, but parameters belonging to
+// different active adapters must not overlap. This setting does not affect
+// RunWithBinding.
+func (o *RunOptions) AddActiveLoraAdapter(adapter *LoraAdapter) error {
+	status := C.RunOptionsAddActiveLoraAdapter(o.o, adapter.l)
 	if status != nil {
 		return statusToError(status)
 	}
@@ -2114,7 +2730,7 @@ func (b *IoBinding) GetBoundOutputNames() ([]string, error) {
 
 	// Start by getting go slice views of the C buffers to make it easier to
 	// work with.
-	sizesSlice := unsafe.Slice(resultSizes, resultCount)
+	sizesSlice := unsafe.Slice(resultSizes, int(resultCount))
 	totalSize := uint64(0)
 	// There is likely a more efficient way, but it's much easier to just get
 	// a go slice of the entire buffer. NOTE: The strings in this buffer are
@@ -2127,10 +2743,10 @@ func (b *IoBinding) GetBoundOutputNames() ([]string, error) {
 
 	// We'll take advantage of the byte-slice-to-string conversion to copy the
 	// data into go-managed memory.
-	toReturn := make([]string, resultCount)
+	toReturn := make([]string, int(resultCount))
 	prevEndOffset := uint64(0)
 	for i, stringLength := range sizesSlice {
-		toReturn[i] = string(charsSlice[prevEndOffset:stringLength])
+		toReturn[i] = string(charsSlice[prevEndOffset : prevEndOffset+uint64(stringLength)])
 		prevEndOffset += uint64(stringLength)
 	}
 
@@ -2168,9 +2784,9 @@ func (b *IoBinding) GetBoundOutputValues() ([]Value, error) {
 	if status != nil {
 		return nil, statusToError(status)
 	}
-	valuesSlice := unsafe.Slice(valuesBuffer, numValues)
+	valuesSlice := unsafe.Slice(valuesBuffer, int(numValues))
 
-	toReturn := make([]Value, numValues)
+	toReturn := make([]Value, int(numValues))
 	for i := range valuesSlice {
 		toReturn[i], e = createGoValueFromOrtValue(valuesSlice[i])
 		if e != nil {
@@ -2392,41 +3008,58 @@ func createGoValueFromOrtValue(v *C.OrtValue) (Value, error) {
 }
 
 // Must only be called if v is known to be of type ONNXTensor. Returns a Tensor
-// wrapping v with the correct Go type. This function always copies v's
-// contents into a new Tensor backed by a Go-managed slice and releases v.
+// wrapping v with the correct Go type. For non-string tensors this will copy
+// the tensor's data into a go-managed slice. In case of errors, this will
+// destroy the original value. In all non-error cases, the returned value must
+// be destroyed by the caller.
+//
+// The issue is that GetTensorMutableData() becomes invalid after v is
+// Released, so we can't release the original OrtValue if a reference to the
+// data slice returned by GetData is still in use elsewhere in go code. We work
+// around this by copying the data into a new OrtValue with a Go-backed buffer.
+// (String tensors are easier, since they can't have mutable data buffers in
+// the first place.)
 func createTensorFromOrtValue(v *C.OrtValue) (Value, error) {
-	// Either in the case of error or otherwise, we'll release v. The issue is
-	// that GetTensorMutableData() becomes invalid after v is Released, so we
-	// can't release v if a reference to the slice returned by GetData is
-	// still referred to outside of the tensor. We work around this by copying
-	// the data into a new tensor and releasing the original.
-	defer C.ReleaseOrtValue(v)
-
 	var pInfo *C.OrtTensorTypeAndShapeInfo
 	status := C.GetTensorTypeAndShape(v, &pInfo)
 	if status != nil {
+		C.ReleaseOrtValue(v)
 		return nil, fmt.Errorf("Error getting type and shape: %w",
 			statusToError(status))
 	}
 	shape, e := getShapeFromInfo(pInfo)
 	if e != nil {
+		C.ReleaseOrtValue(v)
 		return nil, fmt.Errorf("Error getting shape from TypeAndShapeInfo: %w",
 			e)
 	}
 	var tensorElementType C.ONNXTensorElementDataType
 	status = C.GetTensorElementType(pInfo, (*uint32)(&tensorElementType))
 	if status != nil {
+		C.ReleaseOrtValue(v)
 		return nil, fmt.Errorf("Error getting tensor element type: %w",
 			statusToError(status))
 	}
 	C.ReleaseTensorTypeAndShapeInfo(pInfo)
+
+	if tensorElementType == C.ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING {
+		// String tensors. No go-managed data, so no copying needed.
+		return &StringTensor{
+			shape:    shape,
+			ortValue: v,
+		}, nil
+	}
+
+	// For non-string tensors, we will always release the original OrtValue.
+	defer C.ReleaseOrtValue(v)
+
+	// Now we start the process of copying the data into a Go-backed OrtValue.
 	var tensorData unsafe.Pointer
 	status = C.GetTensorMutableData(v, &tensorData)
 	if status != nil {
 		return nil, fmt.Errorf("Error getting tensor mutable data: %w",
 			statusToError(status))
 	}
-
 	switch tensorType := TensorElementDataType(tensorElementType); tensorType {
 	case TensorElementDataTypeFloat:
 		return createTensorWithCData[float32](shape, tensorData)
