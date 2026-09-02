@@ -1,3 +1,3 @@
-module github.com/yalue/onnxruntime_go
+module github.com/infiniflow/onnxruntime_go
 
 go 1.19
